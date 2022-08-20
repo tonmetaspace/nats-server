@@ -837,7 +837,7 @@ func (n *raft) ResumeApply() {
 	if n.hcommit > n.commit {
 		n.debug("Resuming %d replays", n.hcommit+1-n.commit)
 		for index := n.commit + 1; index <= n.hcommit; index++ {
-			if err := n.applyCommit(index); err != nil {
+			if _, err := n.applyCommit(index); err != nil {
 				break
 			}
 		}
@@ -1761,6 +1761,7 @@ const (
 	EntryRemovePeer
 	EntryLeaderTransfer
 	EntrySnapshot
+	EntryCommitMarker
 )
 
 func (t EntryType) String() string {
@@ -1779,6 +1780,8 @@ func (t EntryType) String() string {
 		return "LeaderTransfer"
 	case EntrySnapshot:
 		return "Snapshot"
+	case EntryCommitMarker:
+		return "CommitMarker"
 	}
 	return fmt.Sprintf("Unknown [%d]", uint8(t))
 }
@@ -2325,13 +2328,13 @@ func (n *raft) loadEntry(index uint64) (*appendEntry, error) {
 
 // applyCommit will update our commit index and apply the entry to the apply chan.
 // lock should be held.
-func (n *raft) applyCommit(index uint64) error {
+func (n *raft) applyCommit(index uint64) (bool, error) {
 	if n.state == Closed {
-		return errNodeClosed
+		return false, errNodeClosed
 	}
 	if index <= n.commit {
 		n.debug("Ignoring apply commit for %d, already processed", index)
-		return nil
+		return false, nil
 	}
 	original := n.commit
 	n.commit = index
@@ -2347,7 +2350,7 @@ func (n *raft) applyCommit(index uint64) error {
 		var state StreamState
 		n.wal.FastState(&state)
 		if index < state.FirstSeq {
-			return nil
+			return false, nil
 		}
 		var err error
 		if ae, err = n.loadEntry(index); err != nil {
@@ -2358,11 +2361,12 @@ func (n *raft) applyCommit(index uint64) error {
 				n.warn("Got an error loading %d index: %v", index, err)
 			}
 			n.commit = original
-			return errEntryLoadFailed
+			return false, errEntryLoadFailed
 		}
 	} else {
 		fpae = true
 	}
+	commitMarker := len(ae.entries) == 1 && ae.entries[0].Type == EntryCommitMarker
 
 	ae.buf = nil
 
@@ -2442,7 +2446,7 @@ func (n *raft) applyCommit(index uint64) error {
 		// If we processed inline update our applied index.
 		n.applied = index
 	}
-	return nil
+	return commitMarker, nil
 }
 
 // Used to track a success response and apply entries.
@@ -2467,13 +2471,16 @@ func (n *raft) trackResponse(ar *appendEntryResponse) {
 
 	// See if we have items to apply.
 	var sendHB bool
+	var lastIsCommitMarker bool
+	var err error
 
 	if results := n.acks[ar.index]; results != nil {
 		results[ar.peer] = struct{}{}
 		if nr := len(results); nr >= n.qn {
 			// We have a quorum.
 			for index := n.commit + 1; index <= ar.index; index++ {
-				if err := n.applyCommit(index); err != nil {
+				lastIsCommitMarker, err = n.applyCommit(index)
+				if err != nil {
 					n.error("Got an error apply commit for %d: %v", index, err)
 					break
 				}
@@ -2484,8 +2491,16 @@ func (n *raft) trackResponse(ar *appendEntryResponse) {
 	n.Unlock()
 
 	if sendHB {
-		n.sendHeartbeat()
+		if lastIsCommitMarker {
+			n.sendHeartbeat()
+		} else {
+			n.sendCommitMarker()
+		}
 	}
+}
+
+func (n *raft) sendCommitMarker() {
+	n.sendAppendEntry([]*Entry{{EntryCommitMarker, nil}})
 }
 
 // Used to adjust cluster size and peer count based on added official peers.
@@ -2970,7 +2985,7 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 			n.debug("Paused, not applying %d", ae.commit)
 		} else {
 			for index := n.commit + 1; index <= ae.commit; index++ {
-				if err := n.applyCommit(index); err != nil {
+				if _, err := n.applyCommit(index); err != nil {
 					break
 				}
 			}

@@ -306,7 +306,8 @@ type outbound struct {
 	stc  chan struct{} // Stall chan we create to slow down producers on overrun, e.g. fan-in.
 }
 
-const nbPoolSize = 512
+const nbPoolSize = 4096  // TODO: sane value?
+const nbStartCount = 128 // TODO: sane value?
 
 var nbPool = &sync.Pool{
 	New: func() any {
@@ -592,7 +593,7 @@ func (c *client) initClient() {
 
 	// Outbound data structure setup
 	c.out.sg = sync.NewCond(&(c.mu))
-	c.out.nb = make(net.Buffers, 0, 1024) // TODO: sane value?
+	c.out.nb = make(net.Buffers, 0, nbStartCount)
 	opts := s.getOpts()
 	// Snapshots to avoid mutex access in fast paths.
 	c.out.wdl = opts.WriteDeadline

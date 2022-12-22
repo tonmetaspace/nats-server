@@ -306,8 +306,8 @@ type outbound struct {
 	stc  chan struct{} // Stall chan we create to slow down producers on overrun, e.g. fan-in.
 }
 
-const nbPoolSize = 4096  // TODO: sane value?
-const nbStartCount = 128 // TODO: sane value?
+const nbPoolSize = 65535 // Underlying array size of each buffer
+const nbStartCount = 128 // TODO(nat): This seems OK but maybe there is a more sane value
 
 var nbPool = &sync.Pool{
 	New: func() any {

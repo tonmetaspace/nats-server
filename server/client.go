@@ -306,14 +306,72 @@ type outbound struct {
 	stc  chan struct{} // Stall chan we create to slow down producers on overrun, e.g. fan-in.
 }
 
-const nbPoolSize = 65535 // Underlying array size of each buffer
-const nbStartCount = 128 // TODO(nat): This seems OK but maybe there is a more sane value
+const nbPoolSizeSmall = 1024  // Underlying array size of small buffer
+const nbPoolSizeMedium = 8192 // Underlying array size of medium buffer
+const nbPoolSizeLarge = 32768 // Underlying array size of large buffer
+const nbPoolSizeHuge = 65536  // Underlying array size of huge buffer
+const nbStartCount = 128      // TODO(nat): This seems OK but maybe there is a more sane value
 
-var nbPool = &sync.Pool{
+var nbPoolSmall = &sync.Pool{
 	New: func() any {
-		b := [nbPoolSize]byte{}
+		b := [nbPoolSizeSmall]byte{}
 		return &b
 	},
+}
+
+var nbPoolMedium = &sync.Pool{
+	New: func() any {
+		b := [nbPoolSizeMedium]byte{}
+		return &b
+	},
+}
+
+var nbPoolLarge = &sync.Pool{
+	New: func() any {
+		b := [nbPoolSizeLarge]byte{}
+		return &b
+	},
+}
+
+var nbPoolHuge = &sync.Pool{
+	New: func() any {
+		b := [nbPoolSizeHuge]byte{}
+		return &b
+	},
+}
+
+func nbPoolGet(size int) []byte {
+	if size <= nbPoolSizeSmall {
+		return nbPoolSmall.Get().(*[nbPoolSizeSmall]byte)[:0]
+	}
+	if size <= nbPoolSizeMedium {
+		return nbPoolMedium.Get().(*[nbPoolSizeMedium]byte)[:0]
+	}
+	if size <= nbPoolSizeLarge {
+		return nbPoolLarge.Get().(*[nbPoolSizeLarge]byte)[:0]
+	}
+	return nbPoolHuge.Get().(*[nbPoolSizeHuge]byte)[:0]
+}
+
+func nbPoolPut(b []byte) bool {
+	switch cap(b) {
+	case nbPoolSizeSmall:
+		b := (*[nbPoolSizeSmall]byte)(b[0:nbPoolSizeSmall])
+		nbPoolSmall.Put(b)
+	case nbPoolSizeMedium:
+		b := (*[nbPoolSizeMedium]byte)(b[0:nbPoolSizeMedium])
+		nbPoolMedium.Put(b)
+	case nbPoolSizeLarge:
+		b := (*[nbPoolSizeLarge]byte)(b[0:nbPoolSizeLarge])
+		nbPoolLarge.Put(b)
+	case nbPoolSizeHuge:
+		b := (*[nbPoolSizeHuge]byte)(b[0:nbPoolSizeHuge])
+		nbPoolHuge.Put(b)
+	default:
+		panic("returning something to the pool of the wrong size")
+		return false
+	}
+	return true
 }
 
 type perm struct {
@@ -1501,14 +1559,17 @@ func (c *client) flushOutbound() bool {
 	// and "wnb".
 	consumed := len(c.out.orig) - len(c.out.wnb)
 	for i := 0; i < consumed; i++ {
-		if cap(c.out.orig[i]) != nbPoolSize {
-			// TODO(nat): WebSocket connections might add in buffers that
-			// are not from the pool. Don't try to recycle those as the
-			// underlying array is too small.
-			continue
-		}
-		b := (*[nbPoolSize]byte)(c.out.orig[i][0:nbPoolSize])
-		nbPool.Put(b)
+		nbPoolPut(c.out.orig[i])
+		/*
+			if cap(c.out.orig[i]) != nbPoolSize {
+				// TODO(nat): WebSocket connections might add in buffers that
+				// are not from the pool. Don't try to recycle those as the
+				// underlying array is too small.
+				continue
+			}
+			b := (*[nbPoolSize]byte)(c.out.orig[i][0:nbPoolSize])
+			nbPool.Put(b)
+		*/
 	}
 
 	// At this point it's possible that "nb" has been modified by another
@@ -2077,7 +2138,8 @@ func (c *client) queueOutbound(data []byte) {
 	// in fixed size chunks. This ensures we don't go over the capacity of any
 	// of the buffers and end up reallocating.
 	for len(toBuffer) > 0 {
-		new := nbPool.Get().(*[nbPoolSize]byte)[:0]
+		new := nbPoolGet(len(toBuffer))
+		//new := nbPool.Get().(*[nbPoolSize]byte)[:0]
 		l := len(toBuffer)
 		if c := cap(new); l > c {
 			l = c
@@ -4736,14 +4798,17 @@ func (c *client) flushAndClose(minimalFlush bool) {
 		c.flushOutbound()
 	}
 	for i := range c.out.nb {
-		if cap(c.out.nb[i]) != nbPoolSize {
-			// TODO(nat): WebSocket connections might add in buffers that
-			// are not from the pool. Don't try to recycle those as the
-			// underlying array is too small.
-			continue
-		}
-		b := (*[nbPoolSize]byte)(c.out.nb[i][0:nbPoolSize])
-		nbPool.Put(b)
+		nbPoolPut(c.out.nb[i])
+		/*
+			if cap(c.out.nb[i]) != nbPoolSize {
+				// TODO(nat): WebSocket connections might add in buffers that
+				// are not from the pool. Don't try to recycle those as the
+				// underlying array is too small.
+				continue
+			}
+			b := (*[nbPoolSize]byte)(c.out.nb[i][0:nbPoolSize])
+			nbPool.Put(b)
+		*/
 	}
 	c.out.nb = nil
 

@@ -306,22 +306,13 @@ type outbound struct {
 	stc  chan struct{} // Stall chan we create to slow down producers on overrun, e.g. fan-in.
 }
 
-const nbPoolSizeSmall = 1024  // Underlying array size of small buffer
-const nbPoolSizeMedium = 8192 // Underlying array size of medium buffer
-const nbPoolSizeLarge = 32768 // Underlying array size of large buffer
-const nbPoolSizeHuge = 65536  // Underlying array size of huge buffer
+const nbPoolSizeSmall = 4096  // Underlying array size of medium buffer
+const nbPoolSizeLarge = 65536 // Underlying array size of huge buffer
 const nbStartCount = 128      // TODO(nat): This seems OK but maybe there is a more sane value
 
 var nbPoolSmall = &sync.Pool{
 	New: func() any {
 		b := [nbPoolSizeSmall]byte{}
-		return &b
-	},
-}
-
-var nbPoolMedium = &sync.Pool{
-	New: func() any {
-		b := [nbPoolSizeMedium]byte{}
 		return &b
 	},
 }
@@ -333,24 +324,11 @@ var nbPoolLarge = &sync.Pool{
 	},
 }
 
-var nbPoolHuge = &sync.Pool{
-	New: func() any {
-		b := [nbPoolSizeHuge]byte{}
-		return &b
-	},
-}
-
 func nbPoolGet(size int) []byte {
 	if size <= nbPoolSizeSmall {
 		return nbPoolSmall.Get().(*[nbPoolSizeSmall]byte)[:0]
 	}
-	if size <= nbPoolSizeMedium {
-		return nbPoolMedium.Get().(*[nbPoolSizeMedium]byte)[:0]
-	}
-	if size <= nbPoolSizeLarge {
-		return nbPoolLarge.Get().(*[nbPoolSizeLarge]byte)[:0]
-	}
-	return nbPoolHuge.Get().(*[nbPoolSizeHuge]byte)[:0]
+	return nbPoolLarge.Get().(*[nbPoolSizeLarge]byte)[:0]
 }
 
 func nbPoolPut(b []byte) bool {
@@ -358,15 +336,9 @@ func nbPoolPut(b []byte) bool {
 	case nbPoolSizeSmall:
 		b := (*[nbPoolSizeSmall]byte)(b[0:nbPoolSizeSmall])
 		nbPoolSmall.Put(b)
-	case nbPoolSizeMedium:
-		b := (*[nbPoolSizeMedium]byte)(b[0:nbPoolSizeMedium])
-		nbPoolMedium.Put(b)
 	case nbPoolSizeLarge:
 		b := (*[nbPoolSizeLarge]byte)(b[0:nbPoolSizeLarge])
 		nbPoolLarge.Put(b)
-	case nbPoolSizeHuge:
-		b := (*[nbPoolSizeHuge]byte)(b[0:nbPoolSizeHuge])
-		nbPoolHuge.Put(b)
 	default:
 		panic("returning something to the pool of the wrong size")
 		return false

@@ -50,6 +50,7 @@ type StreamConfig struct {
 	MaxMsgSize   int32           `json:"max_msg_size,omitempty"`
 	Discard      DiscardPolicy   `json:"discard"`
 	Storage      StorageType     `json:"storage"`
+	Compression  CompressionType `json:"compression"`
 	Replicas     int             `json:"num_replicas"`
 	NoAck        bool            `json:"no_ack,omitempty"`
 	Template     string          `json:"template_owner,omitempty"`
@@ -3283,6 +3284,9 @@ func (mset *stream) setupStore(fsCfg *FileStoreConfig) error {
 			return err
 		}
 		mset.store = fs
+	}
+	if mset.cfg.Compression != CompressionTypeNone {
+		mset.store = wrapStreamStoreWithCompression(mset.store, mset.cfg.Compression)
 	}
 	mset.mu.Unlock()
 

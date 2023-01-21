@@ -41,6 +41,7 @@ import (
 
 	"github.com/klauspost/compress/s2"
 	"github.com/minio/highwayhash"
+	"github.com/nats-io/nats-server/v2/server/avl"
 	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
 )
@@ -160,7 +161,7 @@ type msgBlock struct {
 	cexp    time.Duration
 	ctmr    *time.Timer
 	werr    error
-	dmap    map[uint64]struct{}
+	dmap    avl.SequenceSet
 	fch     chan struct{}
 	qch     chan struct{}
 	lchk    [8]byte
@@ -941,13 +942,13 @@ func (mb *msgBlock) rebuildStateLocked() (*LostStreamData, error) {
 			// We need to declare lost data here.
 			ld = &LostStreamData{Msgs: make([]uint64, 0, mb.msgs), Bytes: mb.bytes}
 			for seq := mb.first.seq; seq <= mb.last.seq; seq++ {
-				if _, ok := mb.dmap[seq]; !ok {
+				if !mb.dmap.Exists(seq) {
 					ld.Msgs = append(ld.Msgs, seq)
 				}
 			}
 			// Clear invalid state. We will let this blk be added in here.
 			mb.msgs, mb.bytes, mb.rbytes, mb.fss = 0, 0, 0, nil
-			mb.dmap = nil
+			mb.dmap.Empty()
 			mb.first.seq = mb.last.seq + 1
 		}
 		return ld, err
@@ -974,10 +975,7 @@ func (mb *msgBlock) rebuildStateLocked() (*LostStreamData, error) {
 		if seq == 0 {
 			return
 		}
-		if mb.dmap == nil {
-			mb.dmap = make(map[uint64]struct{})
-		}
-		mb.dmap[seq] = struct{}{}
+		mb.dmap.Insert(seq)
 	}
 
 	var le = binary.LittleEndian
@@ -1062,10 +1060,7 @@ func (mb *msgBlock) rebuildStateLocked() (*LostStreamData, error) {
 			firstNeedsSet, mb.first.seq, mb.first.ts = false, seq, ts
 		}
 
-		var deleted bool
-		if mb.dmap != nil {
-			_, deleted = mb.dmap[seq]
-		}
+		deleted := mb.dmap.Exists(seq)
 
 		// Always set last.
 		mb.last.seq = seq
@@ -1298,11 +1293,8 @@ func (fs *fileStore) expireMsgsOnRecover() {
 			// Process interior deleted msgs.
 			if err == errDeletedMsg {
 				// Update dmap.
-				if len(mb.dmap) > 0 {
-					delete(mb.dmap, seq)
-					if len(mb.dmap) == 0 {
-						mb.dmap = nil
-					}
+				if mb.dmap.Exists(seq) {
+					mb.dmap.Delete(seq)
 				}
 				// Keep this update just in case since we are removing dmap entries.
 				mb.first.seq = seq
@@ -2064,10 +2056,7 @@ func (mb *msgBlock) skipMsg(seq uint64, now time.Time) {
 		}
 	} else {
 		needsRecord = true
-		if mb.dmap == nil {
-			mb.dmap = make(map[uint64]struct{})
-		}
-		mb.dmap[seq] = struct{}{}
+		mb.dmap.Insert(seq)
 	}
 	mb.mu.Unlock()
 
@@ -2326,12 +2315,10 @@ func (fs *fileStore) removeMsg(seq uint64, secure, needFSLock bool) (bool, error
 	}
 
 	// Now check dmap if it is there.
-	if mb.dmap != nil {
-		if _, ok := mb.dmap[seq]; ok {
-			mb.mu.Unlock()
-			fsUnlock()
-			return false, nil
-		}
+	if mb.dmap.Exists(seq) {
+		mb.mu.Unlock()
+		fsUnlock()
+		return false, nil
 	}
 
 	// We used to not have to load in the messages except with callbacks or the filtered subject state (which is now always on).
@@ -2395,14 +2382,11 @@ func (fs *fileStore) removeMsg(seq uint64, secure, needFSLock bool) (bool, error
 		}
 	} else if !isEmpty {
 		// Out of order delete.
-		if mb.dmap == nil {
-			mb.dmap = make(map[uint64]struct{})
-		}
-		mb.dmap[seq] = struct{}{}
+		mb.dmap.Insert(seq)
 		// Check if <25% utilization and minimum size met.
 		if mb.rbytes > compactMinimum && !isLastBlock {
 			// Remove the interior delete records
-			rbytes := mb.rbytes - uint64(len(mb.dmap)*emptyRecordLen)
+			rbytes := mb.rbytes - uint64(mb.dmap.Size()*emptyRecordLen)
 			if rbytes>>2 > mb.bytes {
 				mb.compact()
 			}
@@ -2512,11 +2496,7 @@ func (mb *msgBlock) compact() {
 		if seq == 0 || seq&ebit != 0 || seq < mb.first.seq {
 			return true
 		}
-		var deleted bool
-		if mb.dmap != nil {
-			_, deleted = mb.dmap[seq]
-		}
-		return deleted
+		return mb.dmap.Exists(seq)
 	}
 
 	// For skip msgs.
@@ -2599,9 +2579,9 @@ func (mb *msgBlock) compact() {
 	}
 }
 
-// Nil out our dmap.
+// Empty out our dmap.
 func (mb *msgBlock) deleteDmap() {
-	mb.dmap = nil
+	mb.dmap.Empty()
 }
 
 // Grab info from a slot.
@@ -2693,10 +2673,10 @@ func (mb *msgBlock) flushLoop(fch, qch chan struct{}) {
 		mb.mu.RLock()
 		defer mb.mu.RUnlock()
 		var changed bool
-		if firstSeq != mb.first.seq || lastSeq != mb.last.seq || dmapLen != len(mb.dmap) {
+		if firstSeq != mb.first.seq || lastSeq != mb.last.seq || dmapLen != mb.dmap.Size() {
 			changed = true
 			firstSeq, lastSeq = mb.first.seq, mb.last.seq
-			dmapLen = len(mb.dmap)
+			dmapLen = mb.dmap.Size()
 		}
 		return changed
 	}
@@ -2817,18 +2797,15 @@ func (mb *msgBlock) truncate(sm *StoreMsg) (nmsgs, nbytes uint64, err error) {
 
 	mb.mu.Lock()
 
-	checkDmap := len(mb.dmap) > 0
+	checkDmap := mb.dmap.Size() > 0
 	var smv StoreMsg
 
 	for seq := mb.last.seq; seq > sm.seq; seq-- {
 		if checkDmap {
-			if _, ok := mb.dmap[seq]; ok {
+			if mb.dmap.Exists(seq) {
 				// Delete and skip to next.
-				delete(mb.dmap, seq)
-				if len(mb.dmap) == 0 {
-					mb.dmap = nil
-					checkDmap = false
-				}
+				mb.dmap.Delete(seq)
+				checkDmap = !mb.dmap.IsEmpty()
 				continue
 			}
 		}
@@ -2888,9 +2865,9 @@ func (mb *msgBlock) isEmpty() bool {
 func (mb *msgBlock) selectNextFirst() {
 	var seq uint64
 	for seq = mb.first.seq + 1; seq <= mb.last.seq; seq++ {
-		if _, ok := mb.dmap[seq]; ok {
+		if mb.dmap.Exists(seq) {
 			// We will move past this so we can delete the entry.
-			delete(mb.dmap, seq)
+			mb.dmap.Delete(seq)
 		} else {
 			break
 		}
@@ -3753,7 +3730,7 @@ func (mb *msgBlock) cacheAlreadyLoaded() bool {
 	if mb.cache == nil || mb.cache.off != 0 || mb.cache.fseq == 0 || len(mb.cache.buf) == 0 {
 		return false
 	}
-	numEntries := mb.msgs + uint64(len(mb.dmap)) + (mb.first.seq - mb.cache.fseq)
+	numEntries := mb.msgs + uint64(mb.dmap.Size()) + (mb.first.seq - mb.cache.fseq)
 	return numEntries == uint64(len(mb.cache.idx))
 }
 
@@ -3934,8 +3911,8 @@ func (mb *msgBlock) cacheLookup(seq uint64, sm *StoreMsg) (*StoreMsg, error) {
 	}
 
 	// If we have a delete map check it.
-	if mb.dmap != nil {
-		if _, ok := mb.dmap[seq]; ok {
+	if !mb.dmap.IsEmpty() {
+		if mb.dmap.Exists(seq) {
 			return nil, errDeletedMsg
 		}
 	}
@@ -4308,13 +4285,15 @@ func (fs *fileStore) State() StreamState {
 				}
 			}
 			cur = mb.last.seq + 1 // Expected next first.
-			for seq := range mb.dmap {
+
+			mb.dmap.Range(func(seq uint64) bool {
 				if seq < fseq {
-					delete(mb.dmap, seq)
+					mb.dmap.Delete(seq)
 				} else {
 					state.Deleted = append(state.Deleted, seq)
 				}
-			}
+				return true
+			})
 			mb.mu.Unlock()
 		}
 	}
@@ -4408,11 +4387,11 @@ func (mb *msgBlock) writeIndexInfoLocked() error {
 	n += binary.PutVarint(hdr[n:], mb.first.ts)
 	n += binary.PutUvarint(hdr[n:], mb.last.seq)
 	n += binary.PutVarint(hdr[n:], mb.last.ts)
-	n += binary.PutUvarint(hdr[n:], uint64(len(mb.dmap)))
+	n += binary.PutUvarint(hdr[n:], uint64(mb.dmap.Size()))
 	buf := append(hdr[:n], mb.lchk[:]...)
 
 	// Append a delete map if needed
-	if len(mb.dmap) > 0 {
+	if !mb.dmap.IsEmpty() {
 		buf = append(buf, mb.genDeleteMap()...)
 	}
 
@@ -4529,13 +4508,12 @@ func (mb *msgBlock) readIndexInfo() error {
 
 	// Now check for presence of a delete map
 	if dmapLen > 0 {
-		mb.dmap = make(map[uint64]struct{}, dmapLen)
 		for i := 0; i < int(dmapLen); i++ {
 			seq := readSeq()
 			if seq == 0 {
 				break
 			}
-			mb.dmap[seq+mb.first.seq] = struct{}{}
+			mb.dmap.Insert(seq + mb.first.seq)
 		}
 	}
 
@@ -4543,20 +4521,22 @@ func (mb *msgBlock) readIndexInfo() error {
 }
 
 func (mb *msgBlock) genDeleteMap() []byte {
-	if len(mb.dmap) == 0 {
+	if mb.dmap.IsEmpty() {
 		return nil
 	}
-	buf := make([]byte, len(mb.dmap)*binary.MaxVarintLen64)
+	buf := make([]byte, mb.dmap.Size()*binary.MaxVarintLen64)
 	// We use first seq as an offset to cut down on size.
 	fseq, n := uint64(mb.first.seq), 0
-	for seq := range mb.dmap {
+
+	mb.dmap.Range(func(seq uint64) bool {
 		// This is for lazy cleanup as the first sequence moves up.
 		if seq < fseq {
-			delete(mb.dmap, seq)
+			mb.dmap.Delete(seq)
 		} else {
 			n += binary.PutUvarint(buf[n:], seq-fseq)
 		}
-	}
+		return true
+	})
 	return buf[:n]
 }
 
@@ -4602,7 +4582,7 @@ func (fs *fileStore) dmapEntries() int {
 	var total int
 	fs.mu.RLock()
 	for _, mb := range fs.blks {
-		total += len(mb.dmap)
+		total += mb.dmap.Size()
 	}
 	fs.mu.RUnlock()
 	return total
@@ -4721,10 +4701,7 @@ func (fs *fileStore) PurgeEx(subject string, sequence, keep uint64) (purged uint
 					}
 				} else {
 					// Out of order delete.
-					if mb.dmap == nil {
-						mb.dmap = make(map[uint64]struct{})
-					}
-					mb.dmap[seq] = struct{}{}
+					mb.dmap.Insert(seq)
 				}
 
 				if maxp > 0 && purged >= maxp {
@@ -4879,11 +4856,8 @@ func (fs *fileStore) Compact(seq uint64) (uint64, error) {
 		sm, err := smb.cacheLookup(mseq, &smv)
 		if err == errDeletedMsg {
 			// Update dmap.
-			if len(smb.dmap) > 0 {
-				delete(smb.dmap, seq)
-				if len(smb.dmap) == 0 {
-					smb.dmap = nil
-				}
+			if !smb.dmap.IsEmpty() {
+				smb.dmap.Delete(seq)
 			}
 		} else if sm != nil {
 			sz := fileStoreMsgSize(sm.subj, sm.hdr, sm.msg)

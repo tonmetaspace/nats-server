@@ -1579,6 +1579,23 @@ func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory bool) 
 		}
 	}
 
+	// Check for changes to RePublish.
+	if cfg.RePublish != nil {
+		// Empty same as all.
+		if cfg.RePublish.Source == _EMPTY_ {
+			cfg.RePublish.Source = fwcs
+		}
+		tr, err := newSubjectTransform(cfg.RePublish.Source, cfg.RePublish.Destination)
+		if err != nil {
+			jsa.mu.Unlock()
+			return fmt.Errorf("stream configuration for republish not valid")
+		}
+		// Assign our transform for republishing.
+		mset.tr = tr
+	} else {
+		mset.tr = nil
+	}
+
 	js := mset.js
 
 	if targetTier := tierName(cfg); mset.tier != targetTier {

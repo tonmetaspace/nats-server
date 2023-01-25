@@ -16,6 +16,7 @@ package server
 import (
 	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -58,6 +59,8 @@ type FileStoreConfig struct {
 	AsyncFlush bool
 	// Cipher is the cipher to use when encrypting.
 	Cipher StoreCipher
+	// Compression is the compression algorithm to use.
+	Compression StoreCompression
 }
 
 // FileStreamInfo allows us to remember created time.
@@ -82,6 +85,76 @@ func (cipher StoreCipher) String() string {
 	default:
 		return "Unknown StoreCipher"
 	}
+}
+
+type StoreCompression uint8
+
+const (
+	NoCompression StoreCompression = iota
+	GZIPCompression
+	S2Compression
+)
+
+func (alg StoreCompression) String() string {
+	switch alg {
+	case NoCompression:
+		return "No compression"
+	case GZIPCompression:
+		return "GZIP compression"
+	case S2Compression:
+		return "S2 compression"
+	default:
+		return "Unknown compression"
+	}
+}
+
+type compressionReader func(io.Reader) (io.ReadCloser, error)
+type compressionWriter func(io.Writer) (io.WriteCloser, error)
+
+func getCompression(alg StoreCompression) (
+	compressionReader, // Used to get a decompressor
+	compressionWriter, // Used to get a compressor
+	error,
+) {
+	switch alg {
+	case NoCompression:
+		return nil, nil, nil
+
+	case GZIPCompression:
+		return func(r io.Reader) (io.ReadCloser, error) {
+				return gzip.NewReader(r)
+			}, func(w io.Writer) (io.WriteCloser, error) {
+				return gzip.NewWriter(w), nil
+			}, nil
+
+	case S2Compression:
+		return func(r io.Reader) (io.ReadCloser, error) {
+				return io.NopCloser(s2.NewReader(r)), nil
+			}, func(w io.Writer) (io.WriteCloser, error) {
+				return s2.NewWriter(w), nil
+			}, nil
+
+	default:
+		return nil, nil, fmt.Errorf("unknown compression algorithm")
+	}
+}
+
+type CompressionInfo struct {
+	Algorithm    StoreCompression
+	OriginalSize uint64
+}
+
+func (c *CompressionInfo) Marshal() []byte {
+	return binary.BigEndian.AppendUint64([]byte{byte(c.Algorithm)}, c.OriginalSize)
+}
+
+func (c *CompressionInfo) Unmarshal(b []byte) error {
+	if len(b) < 9 {
+		return fmt.Errorf("not long enough")
+	}
+	c.Algorithm = StoreCompression(b[0])
+	c.OriginalSize = binary.BigEndian.Uint64(b[1:])
+	return nil
 }
 
 // File ConsumerInfo is used for creating consumer stores.
@@ -137,18 +210,19 @@ type msgBlock struct {
 	bek     cipher.Stream
 	seed    []byte
 	nonce   []byte
-	mfn     string
-	mfd     *os.File
-	ifn     string
-	ifd     *os.File
+	mfn     string   // Message block filename
+	mfd     *os.File // Message block file descriptor
+	ifn     string   // Index filename
+	ifd     *os.File // Index file descriptor
+	cfn     string   // Compression metadata filename
 	liwsz   int64
 	index   uint32
 	bytes   uint64 // User visible bytes count.
 	rbytes  uint64 // Total bytes (raw) including deleted. Used for rolling to new blk.
 	msgs    uint64 // User visible message count.
 	fss     map[string]*SimpleState
-	sfn     string
-	kfn     string
+	sfn     string // Subject filename
+	kfn     string // Encryption key filename
 	lwits   int64
 	lwts    int64
 	llts    int64
@@ -214,6 +288,8 @@ const (
 	keyScan = "%d.key"
 	// to look for orphans
 	keyScanAll = "*.key"
+	// used to store our compression algorithm.
+	cmprScan = "%d.cmp"
 	// This is where we keep state on consumers.
 	consumerDir = "obs"
 	// Index file for a consumer.
@@ -651,6 +727,7 @@ func (fs *fileStore) recoverMsgBlock(fi os.FileInfo, index uint32) (*msgBlock, e
 	mb.mfn = filepath.Join(mdir, fi.Name())
 	mb.ifn = filepath.Join(mdir, fmt.Sprintf(indexScan, index))
 	mb.sfn = filepath.Join(mdir, fmt.Sprintf(fssScan, index))
+	mb.cfn = filepath.Join(mdir, fmt.Sprintf(cmprScan, index))
 
 	if mb.hh == nil {
 		key := sha256.Sum256(fs.hashKeyForBlock(index))
@@ -724,6 +801,7 @@ func (fs *fileStore) recoverMsgBlock(fi os.FileInfo, index uint32) (*msgBlock, e
 	} else {
 		return nil, err
 	}
+
 	// Grab last checksum from main block file.
 	var lchk [8]byte
 	if mb.rbytes >= checksumSize {
@@ -966,6 +1044,11 @@ func (mb *msgBlock) rebuildStateLocked() (*LostStreamData, error) {
 			return nil, err
 		}
 		mb.bek.XORKeyStream(buf, buf)
+	}
+
+	// Check if we need to decompress.
+	if buf, err = mb.decompressMsgBlock(buf); err != nil {
+		return nil, err
 	}
 
 	mb.rbytes = uint64(len(buf))
@@ -1849,6 +1932,9 @@ func (fs *fileStore) newMsgBlockForWrite() (*msgBlock, error) {
 		return nil, fmt.Errorf("Error creating msg index file [%q]: %v", mb.mfn, err)
 	}
 	mb.ifd = ifd
+
+	// For compression algorithm, if any.
+	mb.cfn = filepath.Join(mdir, fmt.Sprintf(cmprScan, mb.index))
 
 	// For subject based info.
 	mb.sfn = filepath.Join(mdir, fmt.Sprintf(fssScan, mb.index))
@@ -3425,6 +3511,13 @@ func (fs *fileStore) writeMsgRecord(seq uint64, ts int64, subj string, hdr, msg 
 	// Grab our current last message block.
 	mb := fs.lmb
 	if mb == nil || mb.msgs > 0 && mb.blkSize()+rl > fs.fcfg.BlockSize {
+		if mb != nil && fs.fcfg.Compression != NoCompression {
+			go func(algorithm StoreCompression) {
+				if err := mb.compressMsgBlock(algorithm); err != nil {
+					fmt.Println("Failed to compress block:", err)
+				}
+			}(fs.fcfg.Compression)
+		}
 		if mb, err = fs.newMsgBlockForWrite(); err != nil {
 			return 0, err
 		}
@@ -3853,6 +3946,11 @@ checkCache:
 		}
 		mb.bek = bek
 		mb.bek.XORKeyStream(buf, buf)
+	}
+
+	// Check if we need to decompress.
+	if buf, err = mb.decompressMsgBlock(buf); err != nil {
+		return err
 	}
 
 	if err := mb.indexCacheBuf(buf); err != nil {
@@ -4551,6 +4649,205 @@ func (mb *msgBlock) genDeleteMap() []byte {
 	return buf[:n]
 }
 
+func (mb *msgBlock) compressMsgBlock(algorithm StoreCompression) error {
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+
+	return mb.compressMsgBlockLocked(algorithm)
+}
+
+func (mb *msgBlock) compressMsgBlockLocked(algorithm StoreCompression) error {
+	_, cmpr, err := getCompression(algorithm)
+	if err != nil {
+		return err
+	}
+
+	oldFile := mb.mfn + ".old"  // The uncompressed block will be moved to here during swap
+	tempFile := mb.mfn + ".tmp" // The compressed block will be written here until swap
+	metaFile := mb.cfn          // The compression algorithm will be written here
+	var origClose sync.Once     // Only orig.Close() once
+	var targetClose sync.Once   // Only target.Close() once
+
+	// If there's no compression enabled then don't bother doing anything else,
+	// just make sure that if there's a dangling compression metadata file that
+	// it is removed.
+	if cmpr == nil {
+		if err := os.Remove(metaFile); !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+
+	// First of all, open the original message block file. Work out where the
+	// boundary is between the message block data and the checksum at the end.
+	orig, err := os.Open(mb.mfn)
+	if err != nil {
+		return fmt.Errorf("failed to open %q: %w", mb.mfn, err)
+	}
+	defer origClose.Do(func() { orig.Close() })
+	info, err := orig.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat %q: %w", mb.mfn, err)
+	}
+	bodyLen := info.Size() - checksumSize
+
+	// If the block is now empty then there's no point in compressing it. The
+	// main reason this can happen is after compaction, so make sure that there
+	// isn't a dangling metadata file.
+	if bodyLen < 1 {
+		if err := os.Remove(metaFile); !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+
+	// Create a new temporary file. We'll compress the block into here and drop
+	// the checksum onto the end. If we get to the end of the function and haven't
+	// succeeded then we'll nuke this temporary file. If the file already exists
+	// from a previous attempt then we'll truncate it.
+	target, err := os.OpenFile(tempFile, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0660)
+	if err != nil {
+		return fmt.Errorf("failed to open %q: %w", tempFile, err)
+	}
+	defer targetClose.Do(func() { target.Close() })
+	succeeded := false
+	defer func() {
+		if !succeeded {
+			fmt.Println("Compression failed, cleaning up", tempFile)
+			os.Remove(tempFile)
+		}
+	}()
+
+	// Look up the compressor for the compression algorithm at hand. If the
+	// algorithm in the metadata isn't known then we'll error here.
+	compressor, err := cmpr(target)
+	if err != nil {
+		return err
+	}
+
+	// Excluding the checksum at the end, read in the contents of the message
+	// block and run it through the compressor. The compressor will automatically
+	// write out to the temporary file in the process.
+	wn, err := io.CopyN(compressor, orig, bodyLen)
+	if err != nil {
+		return err
+	} else if wn != bodyLen {
+		return fmt.Errorf("short write on compress (wrote %d, expected %d)", wn, bodyLen)
+	}
+	if err := compressor.Close(); err != nil {
+		return err
+	}
+
+	// Now read in checksum. We'll add the checksum onto the end of the file
+	// uncompressed, otherwise finding the checksum in recoverMsgBlock() becomes
+	// considerably more expensive.
+	var checksum [8]byte
+	if n, err := orig.Read(checksum[:]); err != nil {
+		return fmt.Errorf("failed to read checksum from %q: %w", mb.cfn, err)
+	} else if n != checksumSize {
+		return fmt.Errorf("failed to read checksum from %q: short read", mb.cfn)
+	}
+
+	// Now add the checksum onto the end of the temporary file uncompressed.
+	if n, err := target.Write(checksum[:]); err != nil {
+		return fmt.Errorf("failed to write checksum to %q: %w", tempFile, err)
+	} else if n != checksumSize {
+		return fmt.Errorf("short write on checksum (wrote %d, expected %d)", n, info.Size())
+	}
+
+	// Make sure that everything is flushed out to disk before we try to swap the
+	// files around.
+	if err = target.Sync(); err != nil {
+		return fmt.Errorf("failed to sync %q: %w", tempFile, err)
+	}
+	if origClose.Do(func() { err = orig.Close() }); err != nil {
+		return fmt.Errorf("failed to close %q: %w", tempFile, err)
+	}
+	if targetClose.Do(func() { err = target.Close() }); err != nil {
+		return fmt.Errorf("failed to close %q: %w", tempFile, err)
+	}
+
+	// Move the files around, we'll move the uncompressed block aside and then
+	// put the compressed temporary file in its place.
+	if err = os.Rename(mb.mfn, oldFile); err != nil {
+		return fmt.Errorf("failed to rename %q to %q: %w", mb.mfn, oldFile, err)
+	}
+	if err = os.Rename(tempFile, mb.mfn); err != nil {
+		return fmt.Errorf("failed to rename %q to %q: %w", tempFile, mb.mfn, err)
+	}
+
+	// Write a compression metadata file that contains information about the
+	// compression algorithm used and the original uncompressed size of the block.
+	cinfo := CompressionInfo{
+		Algorithm:    algorithm,
+		OriginalSize: uint64(info.Size()) - checksumSize,
+	}
+	if err = os.WriteFile(metaFile, cinfo.Marshal(), 0660); err != nil {
+		return fmt.Errorf("failed to write %q: %w", metaFile, err)
+	}
+
+	// Clean up the old uncompressed block. At this point we've completed the
+	// compression of the message block.
+	if err = os.Remove(oldFile); err != nil {
+		return fmt.Errorf("failed to delete %q: %w", oldFile, err)
+	}
+	succeeded = true
+	return nil
+}
+
+// Expects that the message block lock is already taken out.
+func (mb *msgBlock) decompressMsgBlock(buf []byte) ([]byte, error) {
+	// Look up if there's a compression metadata file for this message block.
+	// If there isn't then we assume that the message block is not compressed.
+	cmpr, err := os.ReadFile(mb.cfn)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return buf, nil
+		}
+		return nil, err
+	}
+
+	// Unmarshal the compression info. This will tell us which algorithm to
+	// use and how big the decompression buffer should be.
+	var cinfo CompressionInfo
+	if err := cinfo.Unmarshal(cmpr); err != nil {
+		return nil, err
+	}
+	dcmpr, _, err := getCompression(cinfo.Algorithm)
+	if err != nil {
+		return nil, err
+	}
+
+	// If there's no compression reader returned then it means the block
+	// is uncompressed.
+	if dcmpr == nil {
+		return buf, nil
+	}
+	oldBuf := bytes.NewReader(buf[:len(buf)-checksumSize])
+	newBuf := bytes.NewBuffer(make([]byte, 0, cinfo.OriginalSize))
+
+	// Decompress the message block, ignoring the checksum at the end of
+	// the file (as it is left uncompressed).
+	decompressor, err := dcmpr(oldBuf)
+	if err != nil {
+		return nil, err
+	}
+	if n, err := newBuf.ReadFrom(decompressor); err != nil {
+		return nil, err
+	} else if uint64(n) != cinfo.OriginalSize {
+		return nil, fmt.Errorf("decompressed size %d != %d", n, cinfo.OriginalSize)
+	}
+
+	// Finally, add the checksum onto the end of the uncompressed block
+	// and then we're done.
+	if n, err := newBuf.Write(buf[len(buf)-checksumSize:]); err != nil {
+		return nil, err
+	} else if n != checksumSize {
+		return nil, fmt.Errorf("failed to append checksum (%d != %d)", n, checksumSize)
+	}
+	return newBuf.Bytes(), nil
+}
+
 func syncAndClose(mfd, ifd *os.File) {
 	if mfd != nil {
 		mfd.Sync()
@@ -4932,6 +5229,10 @@ func (fs *fileStore) Compact(seq uint64) (uint64, error) {
 			if err = os.WriteFile(smb.mfn, nbuf, defaultFilePerms); err != nil {
 				goto SKIP
 			}
+			if err = smb.compressMsgBlockLocked(smb.fs.fcfg.Compression); err != nil {
+				fmt.Println("Failed to compress:", err)
+				goto SKIP
+			}
 			// Make sure to remove fss state.
 			smb.fss = nil
 			smb.removePerSubjectInfoLocked()
@@ -5200,6 +5501,10 @@ func (mb *msgBlock) dirtyCloseWithRemove(remove bool) {
 		}
 		if mb.kfn != _EMPTY_ {
 			os.Remove(mb.kfn)
+		}
+		if mb.cfn != _EMPTY_ {
+			os.Remove(mb.cfn)
+			mb.cfn = _EMPTY_
 		}
 	}
 }
@@ -5709,6 +6014,11 @@ func (fs *fileStore) streamSnapshot(w io.WriteCloser, state *StreamState, includ
 				return
 			}
 			rbek.XORKeyStream(bbuf, bbuf)
+		}
+		// Check if we need to decompress.
+		if bbuf, err = mb.decompressMsgBlock(bbuf); err != nil {
+			writeErr(fmt.Sprintf("Could not decompress message block [%d]: %v", mb.index, err))
+			return
 		}
 		// Make sure we snapshot the per subject info.
 		mb.writePerSubjectInfo()

@@ -210,11 +210,12 @@ type msgBlock struct {
 	bek     cipher.Stream
 	seed    []byte
 	nonce   []byte
-	mfn     string   // Message block filename
-	mfd     *os.File // Message block file descriptor
-	ifn     string   // Index filename
-	ifd     *os.File // Index file descriptor
-	cfn     string   // Compression metadata filename
+	mfn     string           // Message block filename
+	mfd     *os.File         // Message block file descriptor
+	ifn     string           // Index filename
+	ifd     *os.File         // Index file descriptor
+	cmpr    StoreCompression // Effective compression algorithm on disk
+	cfn     string           // Compression metadata filename
 	liwsz   int64
 	index   uint32
 	bytes   uint64 // User visible bytes count.
@@ -3511,12 +3512,11 @@ func (fs *fileStore) writeMsgRecord(seq uint64, ts int64, subj string, hdr, msg 
 	// Grab our current last message block.
 	mb := fs.lmb
 	if mb == nil || mb.msgs > 0 && mb.blkSize()+rl > fs.fcfg.BlockSize {
-		if mb != nil && fs.fcfg.Compression != NoCompression {
-			go func(algorithm StoreCompression) {
-				if err := mb.compressMsgBlock(algorithm); err != nil {
-					fmt.Println("Failed to compress block:", err)
-				}
-			}(fs.fcfg.Compression)
+		if mb != nil {
+			// TODO(nat): Do we want to be more intelligent about dispatching
+			// background tasks here, since this takes out a lock on the message
+			// block?
+			go mb.compressMsgBlock(fs.fcfg.Compression)
 		}
 		if mb, err = fs.newMsgBlockForWrite(); err != nil {
 			return 0, err
@@ -4380,6 +4380,11 @@ func (fs *fileStore) FastState(state *StreamState) {
 
 // State returns the current state of the stream.
 func (fs *fileStore) State() StreamState {
+	start := time.Now()
+	defer func() {
+		fmt.Println("Time:", time.Since(start))
+	}()
+
 	fs.mu.RLock()
 	state := fs.state
 	state.Consumers = len(fs.cfs)
@@ -4657,22 +4662,28 @@ func (mb *msgBlock) compressMsgBlock(algorithm StoreCompression) error {
 }
 
 func (mb *msgBlock) compressMsgBlockLocked(algorithm StoreCompression) error {
+	// If this msgBlock already reports compression then we shouldn't try to
+	// recompress it.
+	if mb.cmpr != NoCompression {
+		return fmt.Errorf("block already compressed")
+	}
+
 	_, cmpr, err := getCompression(algorithm)
 	if err != nil {
 		return err
 	}
 
-	oldFile := mb.mfn + ".old"  // The uncompressed block will be moved to here during swap
-	tempFile := mb.mfn + ".tmp" // The compressed block will be written here until swap
-	metaFile := mb.cfn          // The compression algorithm will be written here
-	var origClose sync.Once     // Only orig.Close() once
-	var targetClose sync.Once   // Only target.Close() once
+	oldFile := mb.mfn + ".old" // The uncompressed block will be moved to here during swap
+	tmpFile := mb.mfn + ".tmp" // The compressed block will be written here until swap
+	cmpFile := mb.cfn          // The compression algorithm will be written here
+	var origClose sync.Once    // Only orig.Close() once
+	var targetClose sync.Once  // Only target.Close() once
 
 	// If there's no compression enabled then don't bother doing anything else,
 	// just make sure that if there's a dangling compression metadata file that
 	// it is removed.
 	if cmpr == nil {
-		if err := os.Remove(metaFile); !os.IsNotExist(err) {
+		if err := os.Remove(cmpFile); !os.IsNotExist(err) {
 			return err
 		}
 		return nil
@@ -4695,7 +4706,7 @@ func (mb *msgBlock) compressMsgBlockLocked(algorithm StoreCompression) error {
 	// main reason this can happen is after compaction, so make sure that there
 	// isn't a dangling metadata file.
 	if bodyLen < 1 {
-		if err := os.Remove(metaFile); !os.IsNotExist(err) {
+		if err := os.Remove(cmpFile); !os.IsNotExist(err) {
 			return err
 		}
 		return nil
@@ -4705,16 +4716,16 @@ func (mb *msgBlock) compressMsgBlockLocked(algorithm StoreCompression) error {
 	// the checksum onto the end. If we get to the end of the function and haven't
 	// succeeded then we'll nuke this temporary file. If the file already exists
 	// from a previous attempt then we'll truncate it.
-	target, err := os.OpenFile(tempFile, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0660)
+	target, err := os.OpenFile(tmpFile, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0660)
 	if err != nil {
-		return fmt.Errorf("failed to open %q: %w", tempFile, err)
+		return fmt.Errorf("failed to open %q: %w", tmpFile, err)
 	}
 	defer targetClose.Do(func() { target.Close() })
 	succeeded := false
 	defer func() {
 		if !succeeded {
-			fmt.Println("Compression failed, cleaning up", tempFile)
-			os.Remove(tempFile)
+			fmt.Println("Compression failed, cleaning up", tmpFile)
+			os.Remove(tmpFile)
 		}
 	}()
 
@@ -4750,7 +4761,7 @@ func (mb *msgBlock) compressMsgBlockLocked(algorithm StoreCompression) error {
 
 	// Now add the checksum onto the end of the temporary file uncompressed.
 	if n, err := target.Write(checksum[:]); err != nil {
-		return fmt.Errorf("failed to write checksum to %q: %w", tempFile, err)
+		return fmt.Errorf("failed to write checksum to %q: %w", tmpFile, err)
 	} else if n != checksumSize {
 		return fmt.Errorf("short write on checksum (wrote %d, expected %d)", n, info.Size())
 	}
@@ -4758,13 +4769,13 @@ func (mb *msgBlock) compressMsgBlockLocked(algorithm StoreCompression) error {
 	// Make sure that everything is flushed out to disk before we try to swap the
 	// files around.
 	if err = target.Sync(); err != nil {
-		return fmt.Errorf("failed to sync %q: %w", tempFile, err)
+		return fmt.Errorf("failed to sync %q: %w", tmpFile, err)
 	}
 	if origClose.Do(func() { err = orig.Close() }); err != nil {
-		return fmt.Errorf("failed to close %q: %w", tempFile, err)
+		return fmt.Errorf("failed to close %q: %w", tmpFile, err)
 	}
 	if targetClose.Do(func() { err = target.Close() }); err != nil {
-		return fmt.Errorf("failed to close %q: %w", tempFile, err)
+		return fmt.Errorf("failed to close %q: %w", tmpFile, err)
 	}
 
 	// Move the files around, we'll move the uncompressed block aside and then
@@ -4772,8 +4783,8 @@ func (mb *msgBlock) compressMsgBlockLocked(algorithm StoreCompression) error {
 	if err = os.Rename(mb.mfn, oldFile); err != nil {
 		return fmt.Errorf("failed to rename %q to %q: %w", mb.mfn, oldFile, err)
 	}
-	if err = os.Rename(tempFile, mb.mfn); err != nil {
-		return fmt.Errorf("failed to rename %q to %q: %w", tempFile, mb.mfn, err)
+	if err = os.Rename(tmpFile, mb.mfn); err != nil {
+		return fmt.Errorf("failed to rename %q to %q: %w", tmpFile, mb.mfn, err)
 	}
 
 	// Write a compression metadata file that contains information about the
@@ -4782,8 +4793,8 @@ func (mb *msgBlock) compressMsgBlockLocked(algorithm StoreCompression) error {
 		Algorithm:    algorithm,
 		OriginalSize: uint64(info.Size()) - checksumSize,
 	}
-	if err = os.WriteFile(metaFile, cinfo.Marshal(), 0660); err != nil {
-		return fmt.Errorf("failed to write %q: %w", metaFile, err)
+	if err = os.WriteFile(cmpFile, cinfo.Marshal(), 0660); err != nil {
+		return fmt.Errorf("failed to write %q: %w", cmpFile, err)
 	}
 
 	// Clean up the old uncompressed block. At this point we've completed the
@@ -4791,11 +4802,15 @@ func (mb *msgBlock) compressMsgBlockLocked(algorithm StoreCompression) error {
 	if err = os.Remove(oldFile); err != nil {
 		return fmt.Errorf("failed to delete %q: %w", oldFile, err)
 	}
+
+	//fmt.Println("Compressed", filepath.Base(mb.mfn))
 	succeeded = true
+	mb.cmpr = algorithm
 	return nil
 }
 
 // Expects that the message block lock is already taken out.
+// This function is guaranteed to return a buffer if no error is returned.
 func (mb *msgBlock) decompressMsgBlock(buf []byte) ([]byte, error) {
 	// Look up if there's a compression metadata file for this message block.
 	// If there isn't then we assume that the message block is not compressed.
@@ -4813,6 +4828,7 @@ func (mb *msgBlock) decompressMsgBlock(buf []byte) ([]byte, error) {
 	if err := cinfo.Unmarshal(cmpr); err != nil {
 		return nil, err
 	}
+	mb.cmpr = cinfo.Algorithm
 	dcmpr, _, err := getCompression(cinfo.Algorithm)
 	if err != nil {
 		return nil, err
@@ -5229,8 +5245,9 @@ func (fs *fileStore) Compact(seq uint64) (uint64, error) {
 			if err = os.WriteFile(smb.mfn, nbuf, defaultFilePerms); err != nil {
 				goto SKIP
 			}
-			if err = smb.compressMsgBlockLocked(smb.fs.fcfg.Compression); err != nil {
-				fmt.Println("Failed to compress:", err)
+			// Only recompress if the block was compressed at the time we loaded it
+			// (smb.cmpr will default to NoCompression otherwise).
+			if err = smb.compressMsgBlockLocked(smb.cmpr); err != nil {
 				goto SKIP
 			}
 			// Make sure to remove fss state.

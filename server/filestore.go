@@ -16,6 +16,7 @@ package server
 import (
 	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -58,6 +59,8 @@ type FileStoreConfig struct {
 	AsyncFlush bool
 	// Cipher is the cipher to use when encrypting.
 	Cipher StoreCipher
+	// Compression is the algorithm to use when compressing.
+	Compression StoreCompression
 }
 
 // FileStreamInfo allows us to remember created time.
@@ -84,6 +87,27 @@ func (cipher StoreCipher) String() string {
 		return "None"
 	default:
 		return "Unknown StoreCipher"
+	}
+}
+
+type StoreCompression uint8
+
+const (
+	NoCompression StoreCompression = iota
+	GZIPCompression
+	S2Compression
+)
+
+func (alg StoreCompression) String() string {
+	switch alg {
+	case NoCompression:
+		return "None"
+	case GZIPCompression:
+		return "GZIP"
+	case S2Compression:
+		return "S2"
+	default:
+		return "Unknown StoreCompression"
 	}
 }
 
@@ -145,6 +169,8 @@ type msgBlock struct {
 	mfd     *os.File
 	ifn     string
 	ifd     *os.File
+	cmp     StoreCompression // Effective compression at the time of loading the block
+	cfn     string           // Compression metadata filename on disk
 	liwsz   int64
 	index   uint32
 	bytes   uint64 // User visible bytes count.
@@ -222,6 +248,8 @@ const (
 	keyScan = "%d.key"
 	// to look for orphans
 	keyScanAll = "*.key"
+	// used to store our compression algorithm.
+	cmprScan = "%d.cmp"
 	// This is where we keep state on consumers.
 	consumerDir = "obs"
 	// Index file for a consumer.
@@ -659,6 +687,7 @@ func (fs *fileStore) recoverMsgBlock(fi os.FileInfo, index uint32) (*msgBlock, e
 	mb.mfn = filepath.Join(mdir, fi.Name())
 	mb.ifn = filepath.Join(mdir, fmt.Sprintf(indexScan, index))
 	mb.sfn = filepath.Join(mdir, fmt.Sprintf(fssScan, index))
+	mb.cfn = filepath.Join(mdir, fmt.Sprintf(cmprScan, index))
 
 	if mb.hh == nil {
 		key := sha256.Sum256(fs.hashKeyForBlock(index))
@@ -974,6 +1003,11 @@ func (mb *msgBlock) rebuildStateLocked() (*LostStreamData, error) {
 			return nil, err
 		}
 		mb.bek.XORKeyStream(buf, buf)
+	}
+
+	// Check for compression.
+	if buf, err = mb.loadMetadataAndDecompress(buf); err != nil {
+		return nil, err
 	}
 
 	mb.rbytes = uint64(len(buf))
@@ -2142,6 +2176,8 @@ func (fs *fileStore) newMsgBlockForWrite() (*msgBlock, error) {
 	}
 	mb.ifd = ifd
 
+	mb.cfn = filepath.Join(mdir, fmt.Sprintf(cmprScan, mb.index))
+
 	// For subject based info.
 	mb.sfn = filepath.Join(mdir, fmt.Sprintf(fssScan, mb.index))
 
@@ -2633,7 +2669,7 @@ func (fs *fileStore) removeMsg(seq uint64, secure, viaLimits, needFSLock bool) (
 			err = ErrStoreMsgNotFound
 		}
 		fsUnlock()
-		return false, err
+		return false, fmt.Errorf("fs.selectMsgBlock: %w", err)
 	}
 
 	mb.mu.Lock()
@@ -2661,7 +2697,7 @@ func (fs *fileStore) removeMsg(seq uint64, secure, viaLimits, needFSLock bool) (
 		if err := mb.loadMsgsWithLock(); err != nil {
 			mb.mu.Unlock()
 			fsUnlock()
-			return false, err
+			return false, fmt.Errorf("mb.loadMsgsWithLock: %w", err)
 		}
 	}
 
@@ -2670,7 +2706,7 @@ func (fs *fileStore) removeMsg(seq uint64, secure, viaLimits, needFSLock bool) (
 	if err != nil {
 		mb.mu.Unlock()
 		fsUnlock()
-		return false, err
+		return false, fmt.Errorf("mb.cacheLookup: %w", err)
 	}
 	// Grab size
 	msz := fileStoreMsgSize(sm.subj, sm.hdr, sm.msg)
@@ -3170,8 +3206,50 @@ func (mb *msgBlock) truncate(sm *StoreMsg) (nmsgs, nbytes uint64, err error) {
 		}
 	}
 
-	// Truncate our msgs and close file.
-	if mb.mfd != nil {
+	// If the block is compressed then we have to load it into memory
+	// and decompress it, truncate it and then write it back out.
+	// Otherwise, truncate the file itself and close the descriptor.
+	if mb.cmp != NoCompression {
+		buf, err := mb.loadBlock(nil)
+		if err != nil {
+			return 0, 0, fmt.Errorf("failed to load block from disk: %w", err)
+		}
+		if mb.bek != nil && len(buf) > 0 {
+			bek, err := genBlockEncryptionKey(mb.fs.fcfg.Cipher, mb.seed, mb.nonce)
+			if err != nil {
+				return 0, 0, err
+			}
+			mb.bek = bek
+			mb.bek.XORKeyStream(buf, buf)
+		}
+		buf, err = mb.loadMetadataAndDecompress(buf)
+		if err != nil {
+			return 0, 0, fmt.Errorf("failed to decompress block: %w", err)
+		}
+		buf = buf[:eof]
+		copy(mb.lchk[0:], buf[:len(buf)-checksumSize])
+		buf, err = mb.cmp.Compress(buf)
+		if err != nil {
+			return 0, 0, fmt.Errorf("failed to recompress block: %w", err)
+		}
+		if mb.bek != nil && len(buf) > 0 {
+			bek, err := genBlockEncryptionKey(mb.fs.fcfg.Cipher, mb.seed, mb.nonce)
+			if err != nil {
+				return 0, 0, err
+			}
+			mb.bek = bek
+			mb.bek.XORKeyStream(buf, buf)
+		}
+		n, err := mb.writeAt(buf, 0)
+		if err != nil {
+			return 0, 0, fmt.Errorf("failed to rewrite compressed block: %w", err)
+		}
+		if n != len(buf) {
+			return 0, 0, fmt.Errorf("short write (%d != %d)", n, len(buf))
+		}
+		mb.mfd.Truncate(int64(len(buf)))
+		mb.mfd.Sync()
+	} else if mb.mfd != nil {
 		mb.mfd.Truncate(eof)
 		mb.mfd.Sync()
 		// Update our checksum.
@@ -3762,6 +3840,11 @@ func (fs *fileStore) writeMsgRecord(seq uint64, ts int64, subj string, hdr, msg 
 	// Grab our current last message block.
 	mb := fs.lmb
 	if mb == nil || mb.msgs > 0 && mb.blkSize()+rl > fs.fcfg.BlockSize {
+		if mb != nil {
+			// Compress the block
+			// TODO: Do we want to schedule these more intelligently?
+			go mb.compressOnDiskAndStoreMetadata()
+		}
 		if mb, err = fs.newMsgBlockForWrite(); err != nil {
 			return 0, err
 		}
@@ -3771,6 +3854,138 @@ func (fs *fileStore) writeMsgRecord(seq uint64, ts int64, subj string, hdr, msg 
 	err = mb.writeMsgRecord(rl, seq, subj, hdr, msg, ts, fs.fip)
 
 	return rl, err
+}
+
+func (mb *msgBlock) compressOnDiskAndStoreMetadata() error {
+	alg := mb.fs.fcfg.Compression
+	if alg == NoCompression {
+		return nil
+	}
+
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+
+	origFilename := mb.mfn         // The original message block on disk
+	oldFilename := mb.mfn + ".old" // The original message block will be moved here
+	tmpFilename := mb.mfn + ".tmp" // The compressed block will be written here
+	metaFilename := mb.cfn         // The compression metadata will be written here
+
+	origFD, err := os.OpenFile(origFilename, os.O_RDWR, defaultFilePerms)
+	if err != nil {
+		return err
+	}
+	origBuf, err := io.ReadAll(origFD)
+	if err != nil {
+		return fmt.Errorf("failed to read original block from disk: %w", err)
+	}
+	if err := origFD.Close(); err != nil {
+		return fmt.Errorf("failed to close original file: %w", err)
+	}
+
+	if mb.bek != nil && len(origBuf) > 0 {
+		bek, err := genBlockEncryptionKey(mb.fs.fcfg.Cipher, mb.seed, mb.nonce)
+		if err != nil {
+			return err
+		}
+		mb.bek = bek
+		mb.bek.XORKeyStream(origBuf, origBuf)
+	}
+
+	tmpFD, err := os.OpenFile(tmpFilename, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, defaultFilePerms)
+	if err != nil {
+		return fmt.Errorf("failed to create temporary file: %w", err)
+	}
+
+	cmpBuf, err := alg.Compress(origBuf)
+	if err != nil {
+		return fmt.Errorf("failed to compress block: %w", err)
+	}
+
+	if mb.bek != nil && len(cmpBuf) > 0 {
+		bek, err := genBlockEncryptionKey(mb.fs.fcfg.Cipher, mb.seed, mb.nonce)
+		if err != nil {
+			return err
+		}
+		mb.bek = bek
+		mb.bek.XORKeyStream(cmpBuf, cmpBuf)
+	}
+
+	if n, err := tmpFD.Write(cmpBuf); err != nil {
+		return fmt.Errorf("failed to write to temporary file: %w", err)
+	} else if n != len(cmpBuf) {
+		return fmt.Errorf("short write to temporary file (%d != %d)", n, len(cmpBuf))
+	}
+
+	if err := tmpFD.Sync(); err != nil {
+		return fmt.Errorf("failed to sync temporary file: %w", err)
+	}
+	if err := tmpFD.Close(); err != nil {
+		return fmt.Errorf("failed to close temporary file: %w", err)
+	}
+
+	metaFD, err := os.OpenFile(metaFilename, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, defaultFilePerms)
+	if err != nil {
+		return fmt.Errorf("failed to create metadata file: %w", err)
+	}
+
+	meta := &CompressionInfo{
+		Algorithm:    alg,
+		OriginalSize: uint64(len(origBuf)),
+	}
+	metaBuf := meta.MarshalMetadata()
+
+	if n, err := metaFD.Write(metaBuf); err != nil {
+		return fmt.Errorf("failed to write metadata file: %w", err)
+	} else if n != len(metaBuf) {
+		return fmt.Errorf("short write to metadata file (%d != %d)", n, len(metaBuf))
+	}
+	if err := metaFD.Sync(); err != nil {
+		return fmt.Errorf("failed to sync metadata file: %w", err)
+	}
+	if err := metaFD.Close(); err != nil {
+		return fmt.Errorf("failed to close metadata file: %w", err)
+	}
+
+	if err := os.Rename(origFilename, oldFilename); err != nil {
+		return fmt.Errorf("failed to move original file aside: %w", err)
+	}
+	if err := os.Rename(tmpFilename, origFilename); err != nil {
+		return fmt.Errorf("failed to move temporary file into place: %w", err)
+	}
+	if err := os.Remove(oldFilename); err != nil {
+		return fmt.Errorf("failed to delete old file: %w", err)
+	}
+
+	//fmt.Println("Compressed:", mb.mfn)
+	mb.cmp = alg
+	return nil
+}
+
+func (mb *msgBlock) loadMetadataAndDecompress(buf []byte) ([]byte, error) {
+	if mb.cfn == "" {
+		return buf, nil
+	}
+
+	cmpFD, err := os.Open(mb.cfn)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return buf, nil
+		}
+		return nil, err
+	}
+	defer cmpFD.Close()
+
+	cmpBuf, err := io.ReadAll(cmpFD)
+	if err != nil {
+		return nil, err
+	}
+
+	var meta CompressionInfo
+	if err := meta.UnmarshalMetadata(cmpBuf); err != nil {
+		return nil, err
+	}
+
+	return meta.Algorithm.Decompress(buf)
 }
 
 // Sync msg and index files as needed. This is called from a timer.
@@ -4196,6 +4411,11 @@ checkCache:
 		}
 		mb.bek = bek
 		mb.bek.XORKeyStream(buf, buf)
+	}
+
+	// Check for compression.
+	if buf, err = mb.loadMetadataAndDecompress(buf); err != nil {
+		return err
 	}
 
 	if err := mb.indexCacheBuf(buf); err != nil {
@@ -5291,6 +5511,11 @@ func (fs *fileStore) Compact(seq uint64) (uint64, error) {
 				smb.bek = bek
 				smb.bek.XORKeyStream(nbuf, nbuf)
 			}
+			// Recompress if necessary (smb.cmp contains the algorithm used when
+			// the block was loaded from disk, or defaults to NoCompression if not)
+			if nbuf, err = smb.cmp.Compress(nbuf); err != nil {
+				goto SKIP
+			}
 			if err = os.WriteFile(smb.mfn, nbuf, defaultFilePerms); err != nil {
 				goto SKIP
 			}
@@ -6170,6 +6395,13 @@ func (fs *fileStore) streamSnapshot(w io.WriteCloser, state *StreamState, includ
 			}
 			rbek.XORKeyStream(bbuf, bbuf)
 		}
+		// Check for compression.
+		if bbuf, err = mb.loadMetadataAndDecompress(bbuf); err != nil {
+			mb.mu.Unlock()
+			writeErr(fmt.Sprintf("Could not decompress message block [%d]: %v", mb.index, err))
+			return
+		}
+
 		// Make sure we snapshot the per subject info.
 		mb.writePerSubjectInfo()
 		buf, err = os.ReadFile(mb.sfn)
@@ -7318,4 +7550,99 @@ func (ts *templateFileStore) Store(t *streamTemplate) error {
 
 func (ts *templateFileStore) Delete(t *streamTemplate) error {
 	return os.RemoveAll(filepath.Join(ts.dir, t.Name))
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Compression
+////////////////////////////////////////////////////////////////////////////////
+
+type CompressionInfo struct {
+	Algorithm    StoreCompression
+	OriginalSize uint64
+}
+
+func (c *CompressionInfo) MarshalMetadata() []byte {
+	b := []byte{byte(c.Algorithm), 0, 0, 0, 0, 0, 0, 0, 0}
+	binary.BigEndian.PutUint64(b[1:], c.OriginalSize)
+	return b
+}
+
+func (c *CompressionInfo) UnmarshalMetadata(b []byte) error {
+	if len(b) < 9 {
+		return fmt.Errorf("not long enough")
+	}
+	c.Algorithm = StoreCompression(b[0])
+	c.OriginalSize = binary.BigEndian.Uint64(b[1:])
+	return nil
+}
+
+func (alg StoreCompression) Compress(buf []byte) ([]byte, error) {
+	if len(buf) < checksumSize {
+		return nil, fmt.Errorf("uncompressed buffer is too short")
+	}
+	bodyLen := int64(len(buf) - checksumSize)
+	var output bytes.Buffer
+	var writer io.WriteCloser
+	switch alg {
+	case NoCompression:
+		return buf, nil
+	case GZIPCompression:
+		writer = gzip.NewWriter(&output)
+	case S2Compression:
+		writer = s2.NewWriter(&output)
+	default:
+		return nil, fmt.Errorf("compression algorithm not known")
+	}
+
+	input := bytes.NewReader(buf[:bodyLen])
+	checksum := buf[bodyLen:]
+
+	if n, err := io.CopyN(writer, input, bodyLen); err != nil {
+		return nil, fmt.Errorf("error writing to compression writer: %w", err)
+	} else if n != bodyLen {
+		return nil, fmt.Errorf("short write on body (%d != %d)", n, bodyLen)
+	}
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("error closing compression writer: %w", err)
+	}
+
+	if n, err := output.Write(checksum); err != nil {
+		return nil, fmt.Errorf("error writing checksum: %w", err)
+	} else if n != checksumSize {
+		return nil, fmt.Errorf("short write on checksum (%d != %d)", n, checksumSize)
+	}
+
+	return output.Bytes(), nil
+}
+
+func (alg StoreCompression) Decompress(buf []byte) ([]byte, error) {
+	if len(buf) < checksumSize {
+		return nil, fmt.Errorf("compressed buffer is too short")
+	}
+	bodyLen := int64(len(buf) - checksumSize)
+	input := bytes.NewReader(buf[:bodyLen])
+
+	var reader io.ReadCloser
+	switch alg {
+	case NoCompression:
+		return buf, nil
+	case GZIPCompression:
+		var err error
+		if reader, err = gzip.NewReader(input); err != nil {
+			return nil, fmt.Errorf("failed to get GZIP reader: %w", err)
+		}
+	case S2Compression:
+		reader = io.NopCloser(s2.NewReader(input))
+	default:
+		return nil, fmt.Errorf("compression algorithm not known")
+	}
+
+	checksum := buf[bodyLen:]
+	output, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("error reading compression reader: %w", err)
+	}
+	output = append(output, checksum...)
+
+	return output, reader.Close()
 }

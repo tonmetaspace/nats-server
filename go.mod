@@ -2,6 +2,8 @@ module github.com/nats-io/nats-server/v2
 
 go 1.19
 
+replace github.com/nats-io/nats.go => github.com/nats-io/nats.go v1.23.1-0.20230224140150-29c220a73f3f
+
 require (
 	github.com/klauspost/compress v1.15.15
 	github.com/minio/highwayhash v1.0.2
@@ -13,9 +15,4 @@ require (
 	golang.org/x/crypto v0.5.0
 	golang.org/x/sys v0.4.0
 	golang.org/x/time v0.3.0
-)
-
-require (
-	github.com/golang/protobuf v1.4.2 // indirect
-	google.golang.org/protobuf v1.23.0 // indirect
 )

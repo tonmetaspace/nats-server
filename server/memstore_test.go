@@ -317,7 +317,7 @@ func TestMemStoreStreamStateDeleted(t *testing.T) {
 		}
 	}
 	state := ms.State()
-	if len(state.Deleted) != 0 {
+	if state.Deleted.Size() != 0 {
 		t.Fatalf("Expected deleted to be empty")
 	}
 	// Now remove some interior messages.
@@ -342,7 +342,7 @@ func TestMemStoreStreamStateDeleted(t *testing.T) {
 		t.Fatalf("Expected first seq to be 5, got %d", state.FirstSeq)
 	}
 	ms.Purge()
-	if state = ms.State(); len(state.Deleted) != 0 {
+	if state = ms.State(); state.Deleted.Size() != 0 {
 		t.Fatalf("Expected no deleted after purge, got %+v\n", state.Deleted)
 	}
 }

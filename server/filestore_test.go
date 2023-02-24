@@ -2775,7 +2775,7 @@ func TestFileStoreStreamStateDeleted(t *testing.T) {
 		}
 	}
 	state := fs.State()
-	if len(state.Deleted) != 0 {
+	if state.Deleted.Size() != 0 {
 		t.Fatalf("Expected deleted to be empty")
 	}
 	// Now remove some interior messages.
@@ -2800,7 +2800,7 @@ func TestFileStoreStreamStateDeleted(t *testing.T) {
 		t.Fatalf("Expected first seq to be 5, got %d", state.FirstSeq)
 	}
 	fs.Purge()
-	if state = fs.State(); len(state.Deleted) != 0 {
+	if state = fs.State(); state.Deleted.Size() != 0 {
 		t.Fatalf("Expected no deleted after purge, got %+v\n", state.Deleted)
 	}
 }
@@ -4213,7 +4213,7 @@ func TestFileStoreMaxMsgsPerSubject(t *testing.T) {
 		require_NoError(t, err)
 	}
 
-	if state := fs.State(); state.Msgs != 100 || state.FirstSeq != 101 || state.LastSeq != 200 || len(state.Deleted) != 0 {
+	if state := fs.State(); state.Msgs != 100 || state.FirstSeq != 101 || state.LastSeq != 200 || state.Deleted.Size() != 0 {
 		t.Fatalf("Bad state: %+v", state)
 	}
 

@@ -14,6 +14,7 @@
 package avl
 
 import (
+	"encoding/json"
 	"math/rand"
 	"testing"
 )
@@ -216,6 +217,28 @@ func TestSeqSetUnion(t *testing.T) {
 	for _, n := range seqs {
 		require_True(t, ss.Exists(n))
 	}
+}
+
+func TestSeqSetJSON(t *testing.T) {
+	var ss1 SequenceSet
+	var ss2 SequenceSet
+
+	seqs := []uint64{22, 222, 2222, 2, 2, 4}
+	for _, seq := range seqs {
+		ss1.Insert(seq)
+	}
+
+	js, err := json.Marshal(ss1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err = ss2.UnmarshalJSON(js); err != nil {
+		t.Fatal(err)
+	}
+
+	require_True(t, ss1.Nodes() == ss2.Nodes())
+	require_True(t, ss1.Size() == ss2.Size())
 }
 
 func require_NoError(t *testing.T, err error) {

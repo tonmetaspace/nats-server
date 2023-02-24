@@ -21,6 +21,8 @@ import (
 	"io"
 	"strings"
 	"time"
+
+	"github.com/nats-io/nats-server/v2/server/avl"
 )
 
 // StorageType determines how messages are stored for retention.
@@ -144,7 +146,7 @@ type StreamState struct {
 	NumSubjects int               `json:"num_subjects,omitempty"`
 	Subjects    map[string]uint64 `json:"subjects,omitempty"`
 	NumDeleted  int               `json:"num_deleted,omitempty"`
-	Deleted     []uint64          `json:"deleted,omitempty"`
+	Deleted     avl.SequenceSet   `json:"deleted,omitempty"`
 	Lost        *LostStreamData   `json:"lost,omitempty"`
 	Consumers   int               `json:"consumer_count"`
 }

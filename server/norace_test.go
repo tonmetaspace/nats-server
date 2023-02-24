@@ -4070,7 +4070,7 @@ func TestNoRaceJetStreamMemstoreWithLargeInteriorDeletes(t *testing.T) {
 
 	if ss.Msgs != 2 || ss.FirstSeq != 1 || ss.LastSeq != 1_000_001 || ss.NumDeleted != 999999 {
 		// To not print out on error.
-		ss.Deleted = nil
+		ss.Deleted.Empty()
 		t.Fatalf("Bad State: %+v", ss)
 	}
 }

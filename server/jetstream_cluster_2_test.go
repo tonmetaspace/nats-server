@@ -1371,7 +1371,7 @@ func TestJetStreamClusterStreamInfoDeletedDetails(t *testing.T) {
 	if si.State.NumDeleted != 3 {
 		t.Fatalf("Expected %d deleted, got %d", 3, si.State.NumDeleted)
 	}
-	if len(si.State.Deleted) != 0 {
+	if si.State.Deleted.Size() != 0 {
 		t.Fatalf("Expected not deleted details, but got %+v", si.State.Deleted)
 	}
 
@@ -1390,7 +1390,7 @@ func TestJetStreamClusterStreamInfoDeletedDetails(t *testing.T) {
 	if si.State.NumDeleted != 3 {
 		t.Fatalf("Expected %d deleted, got %d", 3, si.State.NumDeleted)
 	}
-	if len(si.State.Deleted) != 3 {
+	if si.State.Deleted.Size() != 3 {
 		t.Fatalf("Expected deleted details, but got %+v", si.State.Deleted)
 	}
 }

@@ -19,6 +19,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/nats-io/nats-server/v2/server/avl"
 )
 
 // TODO(dlc) - This is a fairly simplistic approach but should do for now.
@@ -913,21 +915,18 @@ func (ms *memStore) State() StreamState {
 	state := ms.state
 	state.Consumers = ms.consumers
 	state.NumSubjects = len(ms.fss)
-	state.Deleted = nil
+	state.Deleted = avl.SequenceSet{}
 
 	// Calculate interior delete details.
 	if numDeleted := int((state.LastSeq - state.FirstSeq + 1) - state.Msgs); numDeleted > 0 {
-		state.Deleted = make([]uint64, 0, state.NumDeleted)
 		// TODO(dlc) - Too Simplistic, once state is updated to allow runs etc redo.
 		for seq := state.FirstSeq + 1; seq < ms.state.LastSeq; seq++ {
 			if _, ok := ms.msgs[seq]; !ok {
-				state.Deleted = append(state.Deleted, seq)
+				state.Deleted.Insert(seq)
 			}
 		}
 	}
-	if len(state.Deleted) > 0 {
-		state.NumDeleted = len(state.Deleted)
-	}
+	state.NumDeleted = state.Deleted.Size()
 
 	return state
 }

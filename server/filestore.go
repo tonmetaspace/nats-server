@@ -4269,10 +4269,9 @@ func (fs *fileStore) State() StreamState {
 	state := fs.state
 	state.Consumers = len(fs.cfs)
 	state.NumSubjects = fs.numSubjects()
-	state.Deleted = nil // make sure.
+	state.Deleted = avl.SequenceSet{} // make sure.
 
 	if numDeleted := int((state.LastSeq - state.FirstSeq + 1) - state.Msgs); numDeleted > 0 {
-		state.Deleted = make([]uint64, 0, numDeleted)
 		cur := fs.state.FirstSeq
 
 		for _, mb := range fs.blks {
@@ -4281,33 +4280,30 @@ func (fs *fileStore) State() StreamState {
 			// Account for messages missing from the head.
 			if fseq > cur {
 				for seq := cur; seq < fseq; seq++ {
-					state.Deleted = append(state.Deleted, seq)
+					state.Deleted.Insert(seq)
 				}
 			}
 			cur = mb.last.seq + 1 // Expected next first.
 
-			mb.dmap.Range(func(seq uint64) bool {
-				if seq < fseq {
-					mb.dmap.Delete(seq)
-				} else {
-					state.Deleted = append(state.Deleted, seq)
-				}
-				return true
-			})
+			// TODO: is union suitable here?
+			state.Deleted = *avl.Union(&state.Deleted, &mb.dmap)
+			/*
+				mb.dmap.Range(func(seq uint64) bool {
+					if seq < fseq {
+						mb.dmap.Delete(seq)
+					} else {
+						state.Deleted.Insert(Seq)
+					}
+					return true
+				})
+			*/
 			mb.mu.Unlock()
 		}
 	}
 	fs.mu.RUnlock()
 
 	state.Lost = fs.lostData()
-
-	// Can not be guaranteed to be sorted.
-	if len(state.Deleted) > 0 {
-		sort.Slice(state.Deleted, func(i, j int) bool {
-			return state.Deleted[i] < state.Deleted[j]
-		})
-		state.NumDeleted = len(state.Deleted)
-	}
+	state.NumDeleted = state.Deleted.Size()
 	return state
 }
 

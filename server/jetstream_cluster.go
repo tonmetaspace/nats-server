@@ -31,6 +31,7 @@ import (
 
 	"github.com/klauspost/compress/s2"
 	"github.com/minio/highwayhash"
+	"github.com/nats-io/nats-server/v2/server/avl"
 	"github.com/nats-io/nuid"
 )
 
@@ -6665,12 +6666,12 @@ func encodeStreamMsgAllowCompress(subject, reply string, hdr, msg []byte, lseq u
 
 // StreamSnapshot is used for snapshotting and out of band catch up in clustered mode.
 type streamSnapshot struct {
-	Msgs     uint64   `json:"messages"`
-	Bytes    uint64   `json:"bytes"`
-	FirstSeq uint64   `json:"first_seq"`
-	LastSeq  uint64   `json:"last_seq"`
-	Failed   uint64   `json:"clfs"`
-	Deleted  []uint64 `json:"deleted,omitempty"`
+	Msgs     uint64          `json:"messages"`
+	Bytes    uint64          `json:"bytes"`
+	FirstSeq uint64          `json:"first_seq"`
+	LastSeq  uint64          `json:"last_seq"`
+	Failed   uint64          `json:"clfs"`
+	Deleted  avl.SequenceSet `json:"deleted,omitempty"`
 }
 
 // Grab a snapshot of a stream for clustered mode.
@@ -6940,11 +6941,12 @@ func (mset *stream) processSnapshotDeletes(snap *streamSnapshot) {
 		mset.setLastSeq(state.LastSeq)
 	}
 	// Range the deleted and delete if applicable.
-	for _, dseq := range snap.Deleted {
+	snap.Deleted.Range(func(dseq uint64) bool {
 		if dseq > state.FirstSeq && dseq <= state.LastSeq {
 			mset.store.RemoveMsg(dseq)
 		}
-	}
+		return true
+	})
 }
 
 func (mset *stream) setCatchupPeer(peer string, lag uint64) {

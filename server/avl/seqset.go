@@ -15,6 +15,7 @@ package avl
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"math/bits"
 	"sort"
@@ -187,7 +188,7 @@ const (
 	// hdrLen
 	hdrLen = 2
 	// minimum length of an encoded SequenceSet.
-	minLen = 2 + 4 // magic + version + num nodes.
+	minLen = 2 + 4 + 4 // magic + version + num nodes + size
 )
 
 // EncodeLen returns the bytes needed for encoding.
@@ -198,8 +199,10 @@ func (ss SequenceSet) EncodeLen() int {
 func (ss SequenceSet) Encode(buf []byte) ([]byte, error) {
 	nn, encLen := ss.Nodes(), ss.EncodeLen()
 
-	if len(buf) < encLen {
+	if cap(buf) < encLen {
 		buf = make([]byte, encLen)
+	} else {
+		buf = buf[:encLen]
 	}
 
 	// TODO(dlc) - Go 1.19 introduced Append to not have to keep track.
@@ -210,7 +213,8 @@ func (ss SequenceSet) Encode(buf []byte) ([]byte, error) {
 	buf[0], buf[1] = magic, version
 	i := hdrLen
 	le.PutUint32(buf[i:], uint32(nn))
-	i += 4
+	le.PutUint32(buf[i+4:], uint32(ss.size))
+	i += 8
 	ss.root.nodeIter(func(n *node) {
 		le.PutUint64(buf[i:], n.base)
 		i += 8
@@ -227,24 +231,25 @@ func (ss SequenceSet) Encode(buf []byte) ([]byte, error) {
 // ErrBadEncoding is returned when we can not decode properly.
 var ErrBadEncoding = errors.New("ss: bad encoding")
 
-func Decode(buf []byte) (*SequenceSet, error) {
+func (ss *SequenceSet) Decode(buf []byte) error {
 	if len(buf) < minLen || buf[0] != magic || buf[1] != version {
-		return nil, ErrBadEncoding
+		return ErrBadEncoding
 	}
 
 	var le = binary.LittleEndian
 	index := 2
 	nn := int(le.Uint32(buf[index:]))
-	index += 4
+	sz := int(le.Uint32(buf[index+4:]))
+	index += 8
 
 	expectedLen := minLen + (nn * ((numBuckets+1)*8 + 2))
 	if len(buf) != expectedLen {
-		return nil, ErrBadEncoding
+		return ErrBadEncoding
 	}
 
 	nodes := make([]node, nn)
 
-	var ss SequenceSet
+	ss.Empty()
 	for i := 0; i < nn; i++ {
 		n := &nodes[i]
 		n.base = le.Uint64(buf[index:])
@@ -257,8 +262,25 @@ func Decode(buf []byte) (*SequenceSet, error) {
 		index += 2
 		ss.insertNode(n)
 	}
+	ss.size = sz
 
-	return &ss, nil
+	return nil
+}
+
+func (ss SequenceSet) MarshalJSON() ([]byte, error) {
+	buf, err := ss.Encode(nil)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(buf)
+}
+
+func (ss *SequenceSet) UnmarshalJSON(buf []byte) error {
+	var orig []byte
+	if err := json.Unmarshal(buf, &orig); err != nil {
+		return err
+	}
+	return ss.Decode(orig)
 }
 
 // insertNode places a decoded node into the tree.

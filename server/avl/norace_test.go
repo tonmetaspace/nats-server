@@ -79,6 +79,13 @@ func TestNoRaceSeqSetSizeComparison(t *testing.T) {
 	}
 }
 
+func BenchmarkNoRaceSeqSetEncodeLarge(b *testing.B) {
+	t := &testing.T{}
+	for i := 0; i < b.N; i++ {
+		TestNoRaceSeqSetEncodeLarge(t)
+	}
+}
+
 func TestNoRaceSeqSetEncodeLarge(t *testing.T) {
 	num := 2_500_000
 	max := 5_000_000
@@ -110,7 +117,8 @@ func TestNoRaceSeqSetEncodeLarge(t *testing.T) {
 	}
 
 	start = time.Now()
-	ss2, err := Decode(b)
+	var ss2 SequenceSet
+	err = ss2.Decode(b)
 	require_NoError(t, err)
 	if elapsed := time.Since(start); elapsed > expected {
 		t.Fatalf("Expected decode to take less than %v, got %v", expected, elapsed)
@@ -118,6 +126,7 @@ func TestNoRaceSeqSetEncodeLarge(t *testing.T) {
 		logResults("Decode time is %v\n", elapsed)
 	}
 	require_True(t, ss.Nodes() == ss2.Nodes())
+	require_True(t, ss.Size() == ss2.Size())
 }
 
 func TestNoRaceSeqSetRelativeSpeed(t *testing.T) {

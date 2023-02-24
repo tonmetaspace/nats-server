@@ -8302,11 +8302,11 @@ func TestJetStreamDeleteMsg(t *testing.T) {
 					t.Fatalf("Error fetching message for seq: %d - %v", expectedFirstSeq, err)
 				}
 				expectedState.FirstTime = sm.Time
-				expectedState.Deleted = nil
+				expectedState.Deleted.Empty()
 				expectedState.NumDeleted = 0
 
 				afterState := mset.state()
-				afterState.Deleted = nil
+				afterState.Deleted.Empty()
 				afterState.NumDeleted = 0
 
 				// Ignore first time in this test.
@@ -8357,7 +8357,8 @@ func TestJetStreamDeleteMsg(t *testing.T) {
 
 			expected := StreamState{Msgs: 6, Bytes: 6 * bytesPerMsg, FirstSeq: 12, LastSeq: 20, NumSubjects: 1}
 			state = mset.state()
-			state.FirstTime, state.LastTime, state.Deleted, state.NumDeleted = time.Time{}, time.Time{}, nil, 0
+			state.FirstTime, state.LastTime, state.NumDeleted = time.Time{}, time.Time{}, 0
+			state.Deleted.Empty()
 
 			if !reflect.DeepEqual(expected, state) {
 				t.Fatalf("State not what we expected. Expected %+v, got %+v\n", expected, state)

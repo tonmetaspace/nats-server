@@ -1014,6 +1014,11 @@ func (js *jetStream) monitorCluster() {
 		}
 	}
 
+	doSnapshotImmediately := func() {
+		lastSnap = nil
+		doSnapshot()
+	}
+
 	ru := &recoveryUpdates{
 		removeStreams:   make(map[string]*streamAssignment),
 		removeConsumers: make(map[string]*consumerAssignment),
@@ -1087,7 +1092,7 @@ func (js *jetStream) monitorCluster() {
 			if isLeader {
 				s.sendInternalMsgLocked(serverStatsPingReqSubj, _EMPTY_, nil, nil)
 				// Optionally install a snapshot as we become leader.
-				doSnapshot()
+				doSnapshotImmediately()
 				js.checkClusterSize()
 			}
 
@@ -1893,6 +1898,11 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 		}
 	}
 
+	doSnapshotImmediately := func() {
+		lastSnap, lastSnapTime = nil, time.Time{}
+		doSnapshot()
+	}
+
 	// We will establish a restoreDoneCh no matter what. Will never be triggered unless
 	// we replace with the restore chan.
 	restoreDoneCh := make(<-chan error)
@@ -2006,7 +2016,7 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 					restoreDoneCh = s.processStreamRestore(sa.Client, acc, sa.Config, _EMPTY_, sa.Reply, _EMPTY_)
 					continue
 				} else if n.NeedSnapshot() {
-					doSnapshot()
+					doSnapshotImmediately()
 				}
 				// Always cancel if this was running.
 				stopDirectMonitoring()
@@ -4058,6 +4068,11 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 		}
 	}
 
+	doSnapshotImmediately := func() {
+		lastSnap, lastSnapTime = nil, time.Time{}
+		doSnapshot()
+	}
+
 	// For migration tracking.
 	var mmt *time.Ticker
 	var mmtc <-chan time.Time
@@ -4114,7 +4129,7 @@ func (js *jetStream) monitorConsumer(o *consumer, ca *consumerAssignment) {
 				js.setConsumerAssignmentRecovering(ca)
 			}
 			if err := js.processConsumerLeaderChange(o, isLeader); err == nil && isLeader {
-				doSnapshot()
+				doSnapshotImmediately()
 			}
 
 			// We may receive a leader change after the consumer assignment which would cancel us

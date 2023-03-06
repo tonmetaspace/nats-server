@@ -39,18 +39,12 @@ import (
 
 func testFileStoreAllPermutations(t *testing.T, fn func(t *testing.T, fcfg FileStoreConfig)) {
 	for _, fcfg := range []FileStoreConfig{
-<<<<<<< HEAD
-		{Cipher: NoCipher},
-		{Cipher: ChaCha},
-		{Cipher: AES},
-=======
 		{Cipher: ChaCha, Compression: NoCompression},
 		{Cipher: ChaCha, Compression: GZIPCompression},
 		{Cipher: ChaCha, Compression: S2Compression},
 		{Cipher: AES, Compression: NoCompression},
 		{Cipher: AES, Compression: GZIPCompression},
 		{Cipher: AES, Compression: S2Compression},
->>>>>>> baa9b002 (Message block compression)
 	} {
 		subtestName := fmt.Sprintf("%s-%s", fcfg.Cipher, fcfg.Compression)
 		t.Run(subtestName, func(t *testing.T) {

@@ -93,6 +93,7 @@ type internal struct {
 	stmr     *time.Timer
 	replies  map[string]msgHandler
 	sendq    *ipQueue[*pubMsg]
+	zreqq    *ipQueue[*zReqTask]
 	resetCh  chan struct{}
 	wg       sync.WaitGroup
 	sq       *sendq
@@ -1596,6 +1597,38 @@ func getAcceptEncoding(hdr []byte) compressionType {
 }
 
 func (s *Server) zReq(c *client, reply string, rmsg []byte, fOpts *EventFilterOptions, optz interface{}, respf func() (interface{}, error)) {
+	task := &zReqTask{
+		c:     c,
+		reply: reply,
+		rmsg:  rmsg,
+		fOpts: fOpts,
+		optz:  optz,
+		respf: respf,
+	}
+	s.sys.zreqq.push(task)
+	//s.handlezReq(task.c, task.reply, task.rmsg, task.fOpts, task.optz, task.respf)
+}
+
+func (s *Server) zReqWorker() {
+	for range s.sys.zreqq.ch {
+		task, ok := s.sys.zreqq.popOne()
+		if !ok || task == nil {
+			continue
+		}
+		s.handlezReq(task.c, task.reply, task.rmsg, task.fOpts, task.optz, task.respf)
+	}
+}
+
+type zReqTask struct {
+	c     *client
+	reply string
+	rmsg  []byte
+	fOpts *EventFilterOptions
+	optz  interface{}
+	respf func() (any, error)
+}
+
+func (s *Server) handlezReq(c *client, reply string, rmsg []byte, fOpts *EventFilterOptions, optz interface{}, respf func() (interface{}, error)) {
 	if !s.EventsEnabled() || reply == _EMPTY_ {
 		return
 	}

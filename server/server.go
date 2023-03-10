@@ -1260,6 +1260,7 @@ func (s *Server) setSystemAccount(acc *Account) error {
 		servers: make(map[string]*serverUpdate),
 		replies: make(map[string]msgHandler),
 		sendq:   newIPQueue[*pubMsg](s, "System sendQ"),
+		zreqq:   newIPQueue[*zReqTask](s, "System zReqs"),
 		resetCh: make(chan struct{}),
 		sq:      s.newSendQ(),
 		statsz:  eventsHBInterval,
@@ -1278,6 +1279,9 @@ func (s *Server) setSystemAccount(acc *Account) error {
 	// Start our internal loop to serialize outbound messages.
 	// We do our own wg here since we will stop first during shutdown.
 	go s.internalSendLoop(&s.sys.wg)
+
+	// Start an internal loop to handle zreq messages.
+	go s.zReqWorker()
 
 	// Start up our general subscriptions
 	s.initEventTracking()
